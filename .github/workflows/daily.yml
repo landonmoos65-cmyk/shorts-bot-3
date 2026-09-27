@@ -1,0 +1,51 @@
+name: Jynxzi Short
+
+on:
+  schedule:  # 2 Shorts a day (UTC = 4 PM and 10 PM US Eastern; offset from the other bots)
+    - cron: "0 20 * * *"
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: jynxzi-bot
+  cancel-in-progress: false
+
+jobs:
+  make-short:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: sudo apt-get update && sudo apt-get install -y ffmpeg fonts-dejavu
+      - run: pip install -r requirements.txt
+      - run: python jynxzi.py
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
+          YT_CLIENT_ID: ${{ secrets.YT_CLIENT_ID }}
+          YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
+          YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
+          YT_PRIVACY: ${{ vars.YT_PRIVACY || 'public' }}
+          WATERMARK: ${{ vars.WATERMARK }}
+      - uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: video
+          path: work/final.mp4
+          if-no-files-found: ignore
+      - name: Save history
+        if: always()
+        run: |
+          git config user.name "jynxzi-bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add history.json || exit 0
+          git commit -m "history: $(date -u +%F)" || exit 0
+          git pull --rebase -X theirs || true
+          git push
