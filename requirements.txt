@@ -1,0 +1,8 @@
+requests
+yt-dlp
+curl_cffi
+faster-whisper
+edge-tts>=7.0
+google-api-python-client
+google-auth
+google-auth-oauthlib
