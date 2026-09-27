@@ -1,30 +1,45 @@
 name: Jynxzi Short
 
 on:
-  schedule:  # 2 Shorts a day (UTC = 4 PM and 10 PM US Eastern; offset from the other bots)
-    - cron: "0 20 * * *"
-    - cron: "0 2 * * *"
-  workflow_dispatch:
+  schedule:  # 2 Shorts a day, about 4 PM and 10 PM US Eastern. Odd minutes on purpose: GitHub
+             # delays or drops scheduled runs at busy times like the top of the hour.
+    - cron: "41 20 * * *"
+    - cron: "41 2 * * *"
+  workflow_dispatch:        # "Run workflow" button for manual runs
 
 permissions:
   contents: write
 
-concurrency:
+concurrency:  # never run two at once (they'd fight over history.json)
   group: jynxzi-bot
   cancel-in-progress: false
 
 jobs:
   make-short:
     runs-on: ubuntu-24.04
-    timeout-minutes: 50
+    timeout-minutes: 110
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
+          cache: pip                      # faster installs
+      - uses: actions/cache@v4            # keep the Whisper model between runs (saves ~1 min + a download)
+        with:
+          path: ~/.cache/huggingface
+          key: whisper-models-v1
       - run: sudo apt-get update && sudo apt-get install -y ffmpeg fonts-dejavu
-      - run: pip install -r requirements.txt
-      - run: python jynxzi.py
+      - run: pip install -U -r requirements.txt   # -U: always newest yt-dlp (Twitch/Kick changes)
+      - name: Make and post the Short (up to 3 tries)
+        run: |
+          for i in 1 2 3; do
+            echo "================ Attempt $i of 3 ================"
+            rm -rf work
+            if python jynxzi.py; then echo "Posted on attempt $i"; exit 0; fi
+            if [ $i -lt 3 ]; then echo "Attempt $i didn't post - waiting 8 min, then trying fresh clips"; sleep 480; fi
+          done
+          echo "All 3 attempts failed - check the log above"
+          exit 1
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
