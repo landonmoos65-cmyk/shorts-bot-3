@@ -800,9 +800,27 @@ def pick_music():
     return (random.choice(local), None) if local else (None, None)
 
 
-def build_video(sections, voice, total, ass, out, music=None, duck=None, bleeps=()):
+def make_boom(path):
+    """The vine boom. Uses boom.mp3 / boom.wav from the repo if it's there (the real sound);
+    otherwise generates a similar deep hit: a sine dropping ~190 Hz -> ~45 Hz with a short echo."""
+    for name in ("boom.mp3", "boom.wav", "vine-boom.mp3", "vine_boom.mp3"):
+        src = ROOT / name
+        if src.exists():
+            subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", str(src), "-t", "2.5",
+                            "-af", "aformat=channel_layouts=stereo,aresample=44100", str(path)], check=True)
+            print(f"Using the real vine boom ({name})")
+            return
+    subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i",
+                    "aevalsrc='0.9*sin(2*PI*(45+145*exp(-14*t))*t)*exp(-3.2*t)':s=44100:d=1.3",
+                    "-af", "volume=2.2,asoftclip=type=tanh,lowpass=f=900,aecho=0.8:0.55:55:0.35,"
+                    "afade=t=out:st=0.7:d=0.6,aformat=channel_layouts=stereo",
+                    str(path)], check=True)
+
+
+def build_video(sections, voice, total, ass, out, music=None, duck=None, bleeps=(), booms=()):
     """sections: [(src, start, length, zoom)] played back to back. duck: (start, end) where the
-    real clip plays - music drops so you can hear it. bleeps: [(start, end)] to mute + beep."""
+    real clip plays - music drops so you can hear it. bleeps: [(start, end)] to mute + beep.
+    booms: [seconds] where a vine-boom hit plays (the funniest beats)."""
     parts = []
     for k, (src, start, length, zoom) in enumerate(sections):
         p = WORK / f"part{k}.mp4"
@@ -837,8 +855,23 @@ def build_video(sections, voice, total, ass, out, music=None, duck=None, bleeps=
         duck_f = f",volume=0.25:enable='between(t,{duck[0]:.2f},{duck[1]:.2f})'" if duck else ""
         fc.append(f"[{len(cuts) + 2}:a]volume=0.13{duck_f},afade=t=out:st={max(0, total - 1.5):.2f}:d=1.5[m]")
         mix.append("[m]")
+    booms = [b for b in booms if 0 <= b < total - 0.2]
+    if booms:
+        boom = WORK / "boom.wav"
+        try:
+            make_boom(boom)
+        except Exception as e:  # never lose a post over a sound effect
+            print("boom sound failed, posting without it:", e)
+            booms = []
+    if booms:
+        first = len(cuts) + 2 + (1 if music else 0)  # inputs: bg, voice, whooshes, music, booms, beep
+        for n, b in enumerate(booms):
+            cmd += ["-i", str(boom)]
+            ms = int(b * 1000)
+            fc.append(f"[{first + n}:a]adelay={ms}|{ms},volume=0.9[bm{n}]")
+            mix.append(f"[bm{n}]")
     if bleeps:  # classic 1 kHz censor beep exactly over the muted words
-        k = len(cuts) + 2 + (1 if music else 0)
+        k = len(cuts) + 2 + (1 if music else 0) + len(booms)
         cmd += ["-f", "lavfi", "-t", f"{total:.2f}", "-i", "sine=frequency=1000:sample_rate=44100"]
         fc.append(f"[{k}:a]volume='0.3*({when})':eval=frame,aformat=channel_layouts=stereo[bp]")
         mix.append("[bp]")
