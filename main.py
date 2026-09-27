@@ -880,10 +880,20 @@ def upload(path, meta):
                         "tags": meta.get("tags", []), "categoryId": "20"},
             "status": {"privacyStatus": os.environ.get("YT_PRIVACY", "public"),
                        "selfDeclaredMadeForKids": False}}
-    res = yt.videos().insert(part="snippet,status", body=body,
-                             media_body=MediaFileUpload(str(path), resumable=True)).execute()
-    print("Uploaded: https://youtube.com/shorts/" + res["id"])
-    return res["id"]
+    for attempt in range(4):  # network hiccups / YouTube 5xx: wait and try again
+        try:
+            res = yt.videos().insert(part="snippet,status", body=body,
+                                     media_body=MediaFileUpload(str(path), resumable=True)).execute()
+            print("Uploaded: https://youtube.com/shorts/" + res["id"])
+            return res["id"]
+        except Exception as e:
+            msg = str(e)
+            if "quotaExceeded" in msg or "uploadLimitExceeded" in msg:
+                sys.exit("YouTube daily upload limit reached - the video will be made again next run.")
+            if attempt == 3:
+                raise
+            print(f"Upload failed ({msg[:200]}) - retrying in {60 * (attempt + 1)}s")
+            time.sleep(60 * (attempt + 1))
 
 
 # ---------- main ----------
