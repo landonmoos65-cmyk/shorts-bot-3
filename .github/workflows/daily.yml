@@ -1,17 +1,22 @@
-name: Jynxzi Short
+name: Daily Short
 
 on:
-  schedule:  # 2 Shorts a day, about 4 PM and 10 PM US Eastern. Odd minutes on purpose: GitHub
+  schedule:  # 2 Shorts a day, about 12 PM and 7 PM US Eastern. Odd minutes on purpose: GitHub
              # delays or drops scheduled runs at busy times like the top of the hour.
-    - cron: "41 20 * * *"
-    - cron: "41 2 * * *"
+    - cron: "7 16 * * *"
+    - cron: "7 23 * * *"
   workflow_dispatch:        # "Run workflow" button for manual runs
+    inputs:
+      test_only:
+        description: "Test mode: make the video but DON'T upload (download it from Artifacts)"
+        type: boolean
+        default: false
 
 permissions:
   contents: write
 
 concurrency:  # never run two at once (they'd fight over history.json)
-  group: jynxzi-bot
+  group: shorts-bot
   cancel-in-progress: false
 
 jobs:
@@ -28,14 +33,14 @@ jobs:
         with:
           path: ~/.cache/huggingface
           key: whisper-models-v1
-      - run: sudo apt-get update && sudo apt-get install -y ffmpeg fonts-dejavu
+      - run: sudo apt-get update && sudo apt-get install -y ffmpeg fonts-dejavu espeak-ng   # espeak-ng = offline backup voice
       - run: pip install -U -r requirements.txt   # -U: always newest yt-dlp (Twitch/Kick changes)
       - name: Make and post the Short (up to 3 tries)
         run: |
           for i in 1 2 3; do
             echo "================ Attempt $i of 3 ================"
             rm -rf work
-            if python jynxzi.py; then echo "Posted on attempt $i"; exit 0; fi
+            if python main.py; then echo "Posted on attempt $i"; exit 0; fi
             if [ $i -lt 3 ]; then echo "Attempt $i didn't post - waiting 8 min, then trying fresh clips"; sleep 480; fi
           done
           echo "All 3 attempts failed - check the log above"
@@ -49,18 +54,27 @@ jobs:
           YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
           YT_PRIVACY: ${{ vars.YT_PRIVACY || 'public' }}
           WATERMARK: ${{ vars.WATERMARK }}
+          YT_API_KEY: ${{ secrets.YT_API_KEY }}
+          DRY_RUN: ${{ inputs.test_only && '1' || '' }}
+      # The steps below are housekeeping AFTER posting - they can never turn a posted video
+      # into a "failed" run (continue-on-error), and they retry on their own.
       - uses: actions/upload-artifact@v5
         if: always()
+        continue-on-error: true
         with:
           name: video
           path: work/final.mp4
           if-no-files-found: ignore
       - name: Save history
         if: always()
+        continue-on-error: true
         run: |
-          git config user.name "jynxzi-bot"
+          git config user.name "shorts-bot"
           git config user.email "bot@users.noreply.github.com"
           git add history.json || exit 0
           git commit -m "history: $(date -u +%F)" || exit 0
-          git pull --rebase -X theirs || true
-          git push
+          for i in 1 2 3; do
+            git pull --rebase -X theirs && git push && exit 0
+            echo "push failed - retrying in 15s"; sleep 15
+          done
+          echo "::warning::Couldn't save history.json this time (the video was still posted)"
