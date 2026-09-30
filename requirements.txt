@@ -2,7 +2,9 @@ requests
 yt-dlp
 curl_cffi
 faster-whisper
+numpy
 edge-tts>=7.0
+gTTS
 google-api-python-client
 google-auth
 google-auth-oauthlib

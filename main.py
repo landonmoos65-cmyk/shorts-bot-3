@@ -98,12 +98,47 @@ def load_history():
     return json.loads(HISTORY.read_text()) if HISTORY.exists() else []
 
 
+def api_views(video_ids):
+    """{video_id: views} via the official YouTube Data API (1 quota unit per 50 videos).
+    Uses YT_API_KEY if set, otherwise tries the bot's own upload login."""
+    ids = [v for v in video_ids if v][:50]
+    if not ids:
+        return {}
+    params = {"part": "statistics", "id": ",".join(ids)}
+    key = os.environ.get("YT_API_KEY")
+    if key:
+        r = requests.get("https://www.googleapis.com/youtube/v3/videos", params={**params, "key": key}, timeout=30)
+    else:
+        r = requests.get("https://www.googleapis.com/youtube/v3/videos", params=params, timeout=30,
+                         headers={"Authorization": f"Bearer {yt_access_token()}"})
+    r.raise_for_status()
+    return {i["id"]: int(i["statistics"].get("viewCount", 0)) for i in r.json().get("items", [])}
+
+
+def yt_access_token():
+    from google.auth.transport.requests import Request
+    from google.oauth2.credentials import Credentials
+    creds = Credentials(None, refresh_token=os.environ["YT_REFRESH_TOKEN"],
+                        token_uri="https://oauth2.googleapis.com/token",
+                        client_id=os.environ["YT_CLIENT_ID"], client_secret=os.environ["YT_CLIENT_SECRET"])
+    creds.refresh(Request())
+    return creds.token
+
+
 def update_views(history, max_checks=15):
-    """Refresh view counts of our Shorts from the last 2-21 days (public page, no extra keys)."""
+    """Refresh view counts of our Shorts from the last 2-21 days (public data, no extra keys)."""
     today = dt.date.today()
     todo = [h for h in history if h.get("video") and
             2 <= (today - dt.date.fromisoformat(h["date"])).days <= 21][-max_checks:]
+    feed = {}
+    try:
+        feed = api_views([h["video"] for h in todo])
+    except Exception as e:
+        print("View check via YouTube API failed (learning only - posting is unaffected):", str(e)[:200])
     for h in todo:
+        if h["video"] in feed:
+            h["views"] = feed[h["video"]]
+            continue
         r = subprocess.run([sys.executable, "-m", "yt_dlp", "--skip-download", "--print", "view_count",
                             f"https://www.youtube.com/shorts/{h['video']}"],
                            capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=90)
@@ -404,14 +439,43 @@ def credit_for(c):
 _whisper = None
 
 
+def load_audio_16k(path):
+    """Decode any clip to the raw 16 kHz mono audio Whisper wants, using FFmpeg directly.
+    (faster-whisper's own decoder depends on the PyAV library, whose updates broke it once -
+    FFmpeg is always there and stable.)"""
+    import numpy as np
+    raw = subprocess.run(["ffmpeg", "-v", "error", "-i", str(path), "-vn", "-ac", "1", "-ar", "16000",
+                          "-f", "f32le", "-"], capture_output=True, check=True, timeout=300).stdout
+    return np.frombuffer(raw, np.float32).copy()
+
+
 def transcribe(path):
     """-> list of (start, end, word) using faster-whisper."""
     global _whisper
     from faster_whisper import WhisperModel
     if _whisper is None:
         _whisper = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
-    segs, _ = _whisper.transcribe(str(path), word_timestamps=True, vad_filter=True)
+    audio = load_audio_16k(path)
+    if audio.size < 8000:  # under half a second of audio
+        return []
+    segs, _ = _whisper.transcribe(audio, word_timestamps=True, vad_filter=True)
     return [(w.start, w.end, w.word.strip()) for s in segs for w in (s.words or []) if w.word.strip()]
+
+
+def has_speech(clip, meta, min_words=6):
+    """The shown part must actually contain talking - otherwise it's a silent/boring clip."""
+    n = len(words_in(clip["words"], float(meta["clip_start"]), float(meta["clip_end"])))
+    if n < min_words:
+        print(f"  Rejected: only {n} spoken words in the chosen part - need {min_words}+")
+        return False
+    return True
+
+
+def check_transcripts(clips):
+    """If NOT ONE clip has any words, transcription itself is broken - stop loudly instead of
+    making videos 'blind' (that's what caused silent clips to get picked before)."""
+    if clips and not any(c.get("words") for c in clips):
+        sys.exit("TRANSCRIPTION BROKEN: 0 words in every clip - not posting blind. See errors above.")
 
 
 def snap_window(words, cs, ce, dur, lo=8.0, hi=25.0):
@@ -617,9 +681,9 @@ Return JSON: {{"pass": bool, "problems": ["specific problem + how to fix it"]}}"
 
 
 # ---------- 5. Voice + captions ----------
-async def _tts(text, mp3):
+async def _tts(text, mp3, voice=VOICE):
     words = []
-    comm = edge_tts.Communicate(text, VOICE, rate="+8%", boundary="WordBoundary")
+    comm = edge_tts.Communicate(text, voice, rate="+8%", boundary="WordBoundary")
     with open(mp3, "wb") as f:
         async for chunk in comm.stream():
             if chunk["type"] == "audio":
@@ -631,7 +695,33 @@ async def _tts(text, mp3):
 
 
 def tts(text, mp3):
-    words = asyncio.run(_tts(text, mp3))
+    """Narrator voice with 3 layers so a voice outage can't cost a post:
+    1) Microsoft Edge voices (best) - 4 tries, 2 voices   2) Google TTS   3) espeak-ng (offline)."""
+    mp3 = Path(mp3)
+    words = None
+    for n, voice in enumerate([VOICE, VOICE, "en-US-GuyNeural", "en-US-ChristopherNeural"]):
+        try:
+            words = asyncio.run(_tts(text, mp3, voice))
+            if mp3.exists() and mp3.stat().st_size > 2000:
+                break
+        except Exception as e:
+            print(f"Edge voice {voice} failed ({type(e).__name__}) - retrying")
+        words = None
+        time.sleep(4 * (n + 1))
+    if words is None:
+        words = []
+        try:
+            from gtts import gTTS
+            tmp = mp3.with_suffix(".g.mp3")
+            gTTS(text, lang="en", tld="com").save(str(tmp))
+            subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", str(tmp), "-af", "atempo=1.15", str(mp3)],
+                           check=True)
+            print("Using backup voice: Google TTS")
+        except Exception as e:
+            print(f"Google TTS failed ({e}) - using offline espeak-ng")
+            wav = mp3.with_suffix(".wav")
+            subprocess.run(["espeak-ng", "-v", "en-us", "-s", "165", "-w", str(wav), text], check=True)
+            subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", str(wav), str(mp3)], check=True)
     if not words:  # fallback: spread words evenly
         toks, d = text.split(), duration(mp3)
         words = [(i * d / len(toks), (i + 1) * d / len(toks), w) for i, w in enumerate(toks)]
@@ -806,9 +896,15 @@ def make_boom(path):
     for name in ("boom.mp3", "boom.wav", "vine-boom.mp3", "vine_boom.mp3"):
         src = ROOT / name
         if src.exists():
-            subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", str(src), "-t", "2.5",
-                            "-af", "aformat=channel_layouts=stereo,aresample=44100", str(path)], check=True)
-            print(f"Using the real vine boom ({name})")
+            # trim silence before the hit (so it lands exactly on the beat), cap the length,
+            # and normalize loudness (downloaded files vary a lot)
+            subprocess.run(["ffmpeg", "-y", "-v", "error", "-i", str(src), "-af",
+                            "silenceremove=start_periods=1:start_threshold=-45dB,atrim=end=2.5,"
+                            "loudnorm=I=-14:TP=-1.5:LRA=7,aformat=channel_layouts=stereo,aresample=44100",
+                            str(path)], check=True)
+            if duration(path) < 0.15:
+                raise RuntimeError(f"{name} is empty or silent")
+            print(f"Using the real vine boom ({name}, {duration(path):.2f}s after trimming)")
             return
     subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i",
                     "aevalsrc='0.9*sin(2*PI*(45+145*exp(-14*t))*t)*exp(-3.2*t)':s=44100:d=1.3",
@@ -918,6 +1014,7 @@ def upload(path, meta):
             res = yt.videos().insert(part="snippet,status", body=body,
                                      media_body=MediaFileUpload(str(path), resumable=True)).execute()
             print("Uploaded: https://youtube.com/shorts/" + res["id"])
+            meta["channel_id"] = (res.get("snippet") or {}).get("channelId")  # for view tracking
             return res["id"]
         except Exception as e:
             msg = str(e)
@@ -967,7 +1064,8 @@ def main():
                 c["words"] = []
             c["sheet"] = contact_sheet(c, len(clips))
             clips.append(c)
-    print(f"{len(clips)} clips ready")
+    print(f"{len(clips)} clips ready ({sum(bool(c['words']) for c in clips)} with speech)")
+    check_transcripts(clips)
 
     # 4. Pick + write -> fact-check -> fix (up to 4 tries). Nothing passes = no video today:
     #    better to skip a day than post something bad.
@@ -992,6 +1090,9 @@ def main():
             main_clip["duration"])
         print(f"Clip #{clip_try + 1}: {main_clip['name']} - {main_clip['url']} "
               f"{meta['clip_start']}-{meta['clip_end']}s\n  Intro: {meta.get('intro')}")
+        if not has_speech(main_clip, meta):  # don't waste fact-checks on silent clips
+            rejected.append(idx)
+            continue
         for fix in range(2):  # first check, then one repair + re-check
             checks += 1
             try:
@@ -1087,10 +1188,13 @@ def main():
     build_video(sections, voice, total, ass, out, music, duck, bleeps)
     print(f"Video: {total:.1f}s")
 
-    vid = None if DRY_RUN else upload(out, meta)
+    if DRY_RUN:  # test mode: video is in Artifacts; don't upload or use up the clip
+        print("TEST MODE - not uploaded. Download the video from this run's Artifacts.")
+        return
+    vid = upload(out, meta)
     history.append({"date": str(dt.date.today()), "topic": meta["topic"], "title": meta["source"]["title"],
                     "url": meta["source"]["url"], "video": vid, "streamer": main_clip["name"],
-                    "yt_title": meta["title"], "views": None})
+                    "yt_title": meta["title"], "views": None, "channel_id": meta.get("channel_id")})
     HISTORY.write_text(json.dumps(history, indent=1))
 
 

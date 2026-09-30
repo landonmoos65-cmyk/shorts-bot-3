@@ -23,9 +23,18 @@ BLOCK_WORDS = ["n word", "nword", "n-word", "slur", "racist", "leak", "card", "a
 
 
 def find_candidates(history, avg_views, keep=10):
-    """Jynxzi's most-viewed clips from the last 7 + 30 days we haven't used yet."""
+    """Half recent (last 7/30 days), half all-time classics - never a clip we already used.
+    All-time clips have millions of views, so they're ranked in their own group; otherwise
+    they'd always push the recent ones out."""
     used = {h.get("url") for h in history}
-    got = core.list_twitch(TWITCH_USER, ranges=("7d", "30d"), limit=40)
+    recent = pick_from(core.list_twitch(TWITCH_USER, ranges=("7d", "30d"), limit=40), used, keep // 2)
+    used |= {c["url"] for c in recent}
+    classics = pick_from(core.list_twitch(TWITCH_USER, ranges=("all",), limit=100), used, keep - len(recent))
+    print(f"{STREAMER}: {len(recent)} recent + {len(classics)} all-time candidates")
+    return recent + classics
+
+
+def pick_from(got, used, n):
     pool, seen = [], set()
     for c in got:
         if c["url"] in used or c["url"] in seen or not 8 <= c["duration"] <= 90:
@@ -39,8 +48,7 @@ def find_candidates(history, avg_views, keep=10):
         # recent clips first, then views; a little randomness so we don't always get the same order
         c["score"] = c["views"] * (1 + hits) * (1.5 if c["range"] == "7d" else 1.0) * random.uniform(0.8, 1.2)
         pool.append(c)
-    print(f"{STREAMER}: {len(pool)} unused clips")
-    return sorted(pool, key=lambda c: c["score"], reverse=True)[:keep]
+    return sorted(pool, key=lambda c: c["score"], reverse=True)[:n]
 
 
 def pick_moment(clips, recent, perf, rejected, use_images=True):
@@ -75,12 +83,15 @@ STEP 2 - write:
   Him 💀". Must be TRUE to the clip. Add " #shorts".
 - top_text: max 6 words shown at the top for the first 3s ("Wait for it...", "He did NOT expect this").
 - highlight_words: 6-14 funniest/most important words from the transcript to show in yellow.
+- boom_times: 1-3 exact moments (in the CLIP's own seconds, from the transcript timestamps, inside
+  clip_start..clip_end) for a "vine boom" sound: the punchline word, the peak scream/reaction,
+  or the craziest beat. Use the START time of that word. Fewer is better - only the biggest beats.
 - mood: "funny".
 - description: 1-2 sentences. hashtags: 3. tags: 8.
 
 Return JSON: {{"clip_index": int, "clip_start": float, "clip_end": float, "title": str,
-"top_text": str, "highlight_words": [str], "mood": str, "description": str,
-"hashtags": [str], "tags": [str]}}
+"top_text": str, "highlight_words": [str], "boom_times": [float], "mood": str,
+"description": str, "hashtags": [str], "tags": [str]}}
 
 CLIPS:
 {chr(10).join(blocks)}""", temperature=0.6, images=images)
@@ -117,6 +128,7 @@ base.find_candidates = lambda history, avg_views: find_candidates(history, avg_v
 base.pick_moment = pick_moment
 base.check_moment = check_moment
 core.pick_music = no_music
+base.USE_BOOMS = True
 
 if __name__ == "__main__":
     base.main()

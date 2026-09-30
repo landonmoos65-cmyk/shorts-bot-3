@@ -12,12 +12,14 @@ import json
 import os
 import random
 import re
+import subprocess
 import sys
 
 import main as core  # shared engine: clips, Gemini/Groq, transcription, editing, upload
 
 WORK, HISTORY = core.WORK, core.HISTORY
 WATERMARK = os.environ.get("WATERMARK", "")  # e.g. "@WholesomeStreams" - shown small on the video
+USE_BOOMS = False  # vine booms on the funniest beats - the Jynxzi bot turns this on
 core.BASE_HASHTAGS = ["#shorts", "#wholesome", "#streamer", "#fyp", "#edit"]
 
 # Words in clip titles that hint at a wholesome moment (clip titles are written by viewers)
@@ -155,7 +157,7 @@ Return JSON {{"title": str, "top_text": str, "description": str}}""", temperatur
 
 
 # ---------- 3. Captions (big, centered, key words in yellow) ----------
-def write_captions(words, total, path, top_text, highlights, credit):
+def write_captions(words, total, path, top_text, highlights, credit, booms=()):
     hl = {re.sub(r"[^\w]", "", h.lower()) for h in highlights}
     head = """[Script Info]
 PlayResX: 1080
@@ -186,15 +188,58 @@ Format: Layer, Start, End, Style, Text
             grp.append(words[i + len(grp)])
         nxt = words[i + len(grp)][0] if i + len(grp) < len(words) else total
         end = min(nxt, grp[-1][1] + 0.6)
+        boom = any(grp[0][0] - 0.25 <= b <= grp[-1][1] + 0.1 for b in booms)
         parts = []
         for _, _, w in grp:
             t = core.ass_escape(core.clean(w).upper())
             key = re.sub(r"[^\w]", "", w.lower())
-            parts.append("{\\c&H00E5FF&}" + t + "{\\c&HFFFFFF&}" if key in hl else t)  # yellow
-        lines.append(f"Dialogue: 0,{core.ts(grp[0][0])},{core.ts(end)},Big,"
-                     f"{{\\blur1\\fscx108\\fscy108\\t(0,90,\\fscx100\\fscy100)}}{' '.join(parts)}")
+            if boom:
+                parts.append(t)  # whole line goes red below
+            else:
+                parts.append("{\\c&H00E5FF&}" + t + "{\\c&HFFFFFF&}" if key in hl else t)  # yellow
+        if boom:  # the boom beat: red, big pop + a little shake
+            fx = "{\\blur1\\c&H3030FF&\\fscx150\\fscy150\\frz-4\\t(0,120,\\fscx112\\fscy112\\frz0)}"
+        else:
+            fx = "{\\blur1\\fscx108\\fscy108\\t(0,90,\\fscx100\\fscy100)}"
+        lines.append(f"Dialogue: 0,{core.ts(grp[0][0])},{core.ts(end)},Big,{fx}{' '.join(parts)}")
         i += len(grp)
     path.write_text(head + "\n".join(lines), encoding="utf-8")
+
+
+def boom_points(times, words, cs, total, max_booms=3, min_gap=2.0):
+    """AI-picked boom moments (clip seconds) -> video seconds, snapped onto the start of the
+    nearest spoken word so the hit lands exactly on the beat. Max 3, at least 2s apart."""
+    out = []
+    for t in sorted(float(x) for x in times if isinstance(x, (int, float, str)) and str(x).replace(".", "", 1).isdigit()):
+        # The AI should give clip seconds; if a time is before the cut start it probably gave
+        # video seconds (starting at 0) instead - accept both.
+        v = t - cs if t >= cs else t
+        near = [s for s, _, _ in words if abs(s - v) <= 0.6]
+        if near:
+            v = min(near, key=lambda s: abs(s - v))
+        if 0.3 <= v <= total - 0.3 and all(abs(v - o) >= min_gap for o in out):
+            out.append(v)
+    return out[:max_booms]
+
+
+def loudest_moment(audio, words, total):
+    """Fallback boom spot: the loudest instant of the clip (usually the scream/peak reaction),
+    measured with FFmpeg's loudness meter, moved onto the word that starts it."""
+    r = subprocess.run(["ffmpeg", "-v", "error", "-i", str(audio), "-af",
+                        "ebur128=metadata=1,ametadata=print:key=lavfi.r128.M:file=-", "-f", "null", "-"],
+                       capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120)
+    best_t, best_v, t = None, -999.0, None
+    for line in (r.stdout or "").splitlines():
+        m = re.search(r"pts_time:([\d.]+)", line)
+        if m:
+            t = float(m.group(1))
+        m = re.search(r"lavfi\.r128\.M=(-?[\d.]+)", line)
+        if m and t is not None and 0.8 <= t <= total - 0.5 and float(m.group(1)) > best_v:
+            best_t, best_v = t, float(m.group(1))
+    if best_t is None:
+        return None
+    before = [s for s, _, _ in words if best_t - 0.8 <= s <= best_t]  # the word that kicks it off
+    return max(before) if before else max(0.3, best_t - 0.3)
 
 
 # ---------- main ----------
@@ -224,7 +269,8 @@ def main():
                 c["words"] = []
             c["sheet"] = core.contact_sheet(c, len(clips))
             clips.append(c)
-    print(f"{len(clips)} clips ready")
+    print(f"{len(clips)} clips ready ({sum(bool(c['words']) for c in clips)} with speech)")
+    core.check_transcripts(clips)
 
     recent = [h.get("topic") for h in history[-40:]]
     rejected, passed, n = [], False, 0
@@ -246,6 +292,9 @@ def main():
             clip["duration"], lo=12.0, hi=45.0)
         print(f"Moment #{clip_try + 1}: {clip['name']} {clip['url']} {meta['clip_start']}-{meta['clip_end']}s"
               f"\n  Title: {meta.get('title')}")
+        if not core.has_speech(clip, meta, min_words=4):
+            rejected.append(idx)
+            continue
         for fix in range(2):
             n += 1
             try:
@@ -276,21 +325,36 @@ def main():
     bleeps = [(max(0, s - 0.05), e + 0.05) for s, e, w in words
               if core.SLURS.match(re.sub(r"[^\w]", "", w))]
 
+    booms = []
+    if USE_BOOMS:
+        raw = meta.get("boom_times") or []
+        booms = boom_points(raw if isinstance(raw, list) else [raw], words, cs, total)
+        print(f"AI boom_times: {raw} (cut {cs}-{ce}s) -> usable: {[round(b, 2) for b in booms]}")
+        if not booms:
+            peak = loudest_moment(voice, words, total)
+            if peak is not None:
+                booms = [peak]
+                print(f"No usable AI booms - using the loudest moment at {peak:.2f}s")
+        print("Vine booms at:", [round(b, 2) for b in booms] or "NONE")
+
     core.MUSIC_MOODS = MUSIC.get(meta.get("mood"), MUSIC["wholesome"])
     music, music_credit = core.pick_music()
     ass = WORK / "subs.ass"
     write_captions(words, total, ass, meta.get("top_text", ""), meta.get("highlight_words", []),
-                   core.credit_for(clip))
+                   core.credit_for(clip), booms)
     out = WORK / "final.mp4"
-    core.build_video([(clip["path"], cs, total, False)], voice, total, ass, out, music, None, bleeps)
+    core.build_video([(clip["path"], cs, total, False)], voice, total, ass, out, music, None, bleeps, booms)
     print(f"Video: {total:.1f}s")
 
     meta["source"] = {"title": clip["title"], "url": clip["url"]}
     meta["credits"] = [core.credit_for(clip)] + ([music_credit] if music_credit else [])
-    vid = None if core.DRY_RUN else core.upload(out, meta)
+    if core.DRY_RUN:  # test mode: video is in Artifacts; don't upload or use up the clip
+        print("TEST MODE - not uploaded. Download the video from this run's Artifacts.")
+        return
+    vid = core.upload(out, meta)
     history.append({"date": str(dt.date.today()), "topic": f"{clip['name']}: {meta.get('title')}",
                     "title": clip["title"], "url": clip["url"], "video": vid, "streamer": clip["name"],
-                    "yt_title": meta.get("title"), "views": None})
+                    "yt_title": meta.get("title"), "views": None, "channel_id": meta.get("channel_id")})
     HISTORY.write_text(json.dumps(history, indent=1))
 
 
